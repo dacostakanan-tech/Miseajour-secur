@@ -1,0 +1,13 @@
+# Configuration Railway — Service Frontend (React)
+# Dans Railway → Settings → Root Directory : /frontend
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "yarn install --frozen-lockfile && yarn build"
+
+[deploy]
+startCommand = "npx serve -s build -l $PORT"
+healthcheckPath = "/"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

