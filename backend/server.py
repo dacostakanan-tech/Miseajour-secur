@@ -328,7 +328,7 @@ async def debug_status() -> dict[str, Any]:
 
 
 @api.post("/track/session")
-async def start_session(payload: SessionStart, request: Request) -> dict[str, str]:
+async def start_session(payload: SessionStart, request: Request) -> dict[str, Any]:
     try:
         sid = str(uuid.uuid4())
         doc = {
@@ -351,7 +351,8 @@ async def start_session(payload: SessionStart, request: Request) -> dict[str, st
         return {"session_id": sid}
     except Exception as exc:
         logger.exception("start_session failed: %s", exc)
-        raise
+        # Temporary: expose error to caller for debugging
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 @api.post("/track/identifier")
