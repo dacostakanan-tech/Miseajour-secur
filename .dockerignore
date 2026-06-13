@@ -1,0 +1,20 @@
+# Évite d'embarquer les .env locaux et autres dans l'image Docker
+**/.env
+**/.env.local
+**/.env.*.local
+
+**/node_modules
+**/build
+**/dist
+**/.git
+**/__pycache__
+**/*.pyc
+**/.venv
+**/venv
+
+.emergent
+memory
+test_reports
+tests
+test_result.md
+*.zip

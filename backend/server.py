@@ -17,7 +17,9 @@ from typing import Any, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
@@ -370,3 +372,28 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client() -> None:
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# Serve the built React frontend (single-service deployment, e.g. on Railway).
+# The Dockerfile copies the React build output into ./static next to this file.
+# API routes (prefixed with /api) keep priority because they were declared
+# before the catch-all below.
+# ---------------------------------------------------------------------------
+STATIC_DIR = ROOT_DIR / "static"
+if STATIC_DIR.exists():
+    inner_static = STATIC_DIR / "static"
+    if inner_static.exists():
+        app.mount("/static", StaticFiles(directory=str(inner_static)), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        if full_path.startswith("api"):
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = STATIC_DIR / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(str(candidate))
+        index_file = STATIC_DIR / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
+        raise HTTPException(status_code=404, detail="Frontend not built")
