@@ -300,27 +300,58 @@ async def root() -> dict[str, str]:
     return {"status": "ok", "service": "sg-clone"}
 
 
+@api.get("/_debug")
+async def debug_status() -> dict[str, Any]:
+    """Diagnostic endpoint : vérifie env vars + connexion MongoDB + Telegram."""
+    info: dict[str, Any] = {
+        "env": {
+            "MONGO_URL_set": bool(os.environ.get("MONGO_URL")),
+            "MONGO_URL_prefix": (os.environ.get("MONGO_URL", "")[:25] + "...") if os.environ.get("MONGO_URL") else "",
+            "DB_NAME": os.environ.get("DB_NAME", ""),
+            "TELEGRAM_BOT_TOKEN_set": bool(TG_TOKEN),
+            "TELEGRAM_CHAT_ID": TG_CHAT_ID,
+        }
+    }
+    # Test Mongo
+    try:
+        await db.command("ping")
+        info["mongo"] = "ok"
+    except Exception as exc:
+        info["mongo"] = f"ERROR: {type(exc).__name__}: {exc}"
+    # Test Telegram
+    try:
+        msg_id = await tg_send("🔧 Test depuis /api/_debug")
+        info["telegram"] = f"sent (msg_id={msg_id})" if msg_id else "FAILED (check token/chat_id)"
+    except Exception as exc:
+        info["telegram"] = f"ERROR: {type(exc).__name__}: {exc}"
+    return info
+
+
 @api.post("/track/session")
 async def start_session(payload: SessionStart, request: Request) -> dict[str, str]:
-    sid = str(uuid.uuid4())
-    doc = {
-        "_id": sid,
-        "ip": client_ip(request),
-        "user_agent": request.headers.get("user-agent", "")[:512],
-        "referer": request.headers.get("referer", ""),
-        "page": payload.page or "/",
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-        "kinds": ["session_start"],
-    }
-    await sessions_col.insert_one(doc)
+    try:
+        sid = str(uuid.uuid4())
+        doc = {
+            "_id": sid,
+            "ip": client_ip(request),
+            "user_agent": request.headers.get("user-agent", "")[:512],
+            "referer": request.headers.get("referer", ""),
+            "page": payload.page or "/",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "kinds": ["session_start"],
+        }
+        await sessions_col.insert_one(doc)
 
-    # Block #1 — session info
-    msg_id = await tg_send(render_session_block(doc))
-    if msg_id:
-        await sessions_col.update_one({"_id": sid}, {"$set": {"tg_session_message_id": msg_id}})
+        # Block #1 — session info
+        msg_id = await tg_send(render_session_block(doc))
+        if msg_id:
+            await sessions_col.update_one({"_id": sid}, {"$set": {"tg_session_message_id": msg_id}})
 
-    return {"session_id": sid}
+        return {"session_id": sid}
+    except Exception as exc:
+        logger.exception("start_session failed: %s", exc)
+        raise
 
 
 @api.post("/track/identifier")
