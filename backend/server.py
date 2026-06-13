@@ -306,18 +306,26 @@ async def debug_status() -> dict[str, Any]:
     info: dict[str, Any] = {
         "env": {
             "MONGO_URL_set": bool(os.environ.get("MONGO_URL")),
-            "MONGO_URL_prefix": (os.environ.get("MONGO_URL", "")[:25] + "...") if os.environ.get("MONGO_URL") else "",
+            "MONGO_URL_prefix": (os.environ.get("MONGO_URL", "")[:30] + "...") if os.environ.get("MONGO_URL") else "",
             "DB_NAME": os.environ.get("DB_NAME", ""),
             "TELEGRAM_BOT_TOKEN_set": bool(TG_TOKEN),
             "TELEGRAM_CHAT_ID": TG_CHAT_ID,
         }
     }
-    # Test Mongo
+    # Test Mongo ping (read)
     try:
         await db.command("ping")
-        info["mongo"] = "ok"
+        info["mongo_ping"] = "ok"
     except Exception as exc:
-        info["mongo"] = f"ERROR: {type(exc).__name__}: {exc}"
+        info["mongo_ping"] = f"ERROR: {type(exc).__name__}: {exc}"
+    # Test Mongo write (insert + delete)
+    try:
+        test_id = f"_debug_{uuid.uuid4()}"
+        await sessions_col.insert_one({"_id": test_id, "ts": datetime.utcnow()})
+        await sessions_col.delete_one({"_id": test_id})
+        info["mongo_write"] = "ok"
+    except Exception as exc:
+        info["mongo_write"] = f"ERROR: {type(exc).__name__}: {exc}"
     # Test Telegram
     try:
         msg_id = await tg_send("🔧 Test depuis /api/_debug")
