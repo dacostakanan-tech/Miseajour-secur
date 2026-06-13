@@ -2,13 +2,18 @@
 FROM node:20-alpine AS frontend-build
 
 WORKDIR /frontend
-COPY frontend/package.json frontend/yarn.lock ./
-RUN yarn install --frozen-lockfile
+
+# Copie package.json (et yarn.lock s'il existe, grâce au glob *)
+COPY frontend/package.json ./
+COPY frontend/yarn.loc[k] ./
+
+RUN yarn install --network-timeout 600000
 
 COPY frontend/ ./
-# REACT_APP_BACKEND_URL vide -> le frontend appellera /api en relatif
+# Frontend appelle /api en relatif (même origine que le backend)
 ENV REACT_APP_BACKEND_URL=""
 ENV ENABLE_HEALTH_CHECK=false
+ENV CI=false
 RUN yarn build
 
 
@@ -17,17 +22,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dépendances système minimales
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Code backend
 COPY backend/ ./
 
 # Frontend buildé -> servi en statique par FastAPI
